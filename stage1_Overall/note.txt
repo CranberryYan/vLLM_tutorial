@@ -1,0 +1,168 @@
+1. Prefill 阶段
+  整段 prompt 一次性过 Transformer;
+  计算出最后一层的 KV Cache
+2. Decode 阶段
+  每次只输入上一步生成的 token
+  只更新 KV Cache, 无需重新计算
+3. vLLM 核心优化
+  把 KV Cache 存成[分页]形式, 避免碎片化
+  支持多个请求的 KV Cache 高效拼接
+4. Scheduler & Continuous Batching
+  有10个不同的prompt, 长度不同, vLLM会动态调度, 将他们拼在一起
+
+Q1: HuggingFace Transformer来跑100个不同长度的 prompt, 和 vLLM 对比, 性能差异?
+  HuggingFace: 串行, 一个请求 -> done -> 下一个请求
+  vLLM: 并行, 多个请求流水线并行
+
+Q2: 那个阶段(Prefill or Decode)会更受影响?
+  我认为 Decode 阶段会更受影响, 因为 Prefill 阶段是所有 prompt 一次性过整个网络,
+  会得到一个很大的 tensor, 算力可以充分利用; Decode 阶段每次只处理一个 token,
+  所以瓶颈在带宽和调度方式, 如果有一个好的调度方式, Decode 阶段性能会大幅提升;
+
+  HuggingFace: 单个请求逐个处理 token -> 小 tensor -> 大部分算力闲置
+  vLLM: 多个请求的 Decode 拼接(Continuous Batching) + 内存优化(pageAttention)
+
+L1: Prefill-heavy vs Decode-heavy
+  NUM_REQUESTS        = 128     # 并发请求数, 128个用户同时提问
+  # Prefill 做了大部分工作, Decode 可以忽略
+  LONG_PROMPT_TOKENS  = 1024    # Prefill heavy 长上下文
+  PREFILL_MAX_TOKENS  = 16      # Prefill heavy 生成更短
+  # Decode 做了大部分工作, Prefill 可以忽略
+  SHORT_PROMPT_TOKENS = 10      # Decode heavy 短上下文
+  DECODE_MAX_TOKENS   = 512     # Decode heavy 生成更长
+
+  res:
+    # 8 个请求, 每个请求有着短 prompt(prompts_decode), 短生成(8)
+    run_case("WARMUP (short prompt, few tokens)", prompt_decode[:8], 8)
+    Input tokens:   88    (282 tok/s)
+    Output tokens:  64    (205 tok/s)
+    GPU没吃满
+
+    # Prefill heavy
+    run_case("PREFILL-HEAVY (long prompt, short decode)", prompts_prefill, PREFILL_MAX_TOKENS)
+    Input tokens:   131200  (328,810 tok/s)
+    Output tokens:  2048    (5,133 tok/s)
+    现象: 输入吞吐量暴涨, 输出吞吐量不高
+    原因: prompt 长, Prefill 阶段一次性通过大 batch, 算力利用率拉满
+          生成短, 每个请求只生成 PREFILL_MAX_TOKENS 个 token, 所以输出 token 少
+
+    # Decode heavy
+    run_case("DECODE-HEAVY (short prompt, long decode)", prompts_decode, DECODE_MAX_TOKENS)
+    Input tokens:   1408    (180 tok/s)
+    Output tokens:  65,536  (8,389 tok/s)
+    现象: 输入吞吐量极低, 输出吞吐量大幅提高
+    原因: prompt 很短, Prefill 阶段利用不足
+          生成很长, Decode 阶段占主导
+          continuous batching: 把 128 个请求的 decode 拼在一起, 虽然 Decode 是逐 token 的, 但是 128个用户同时并行,
+          总量大, 时间没有很大变化 -> 输出吞吐量变大
+
+L2: Continuous Batching
+  128 个用户请求, prompt 短、生成长, 并且用户不是同时来, 而是平均每秒 64 个陆续到达
+  NUM_REQ       = 128                 # 请求总数
+  PROMPT_TOKENS = 10                  # 短上下文 -> decode 重, 该实验主要测试 Continuous Batching(Decode)
+  GEN_TOKENS    = 256                 # 生成长度, 该实验主要测试 Continuous Batching(Decode)
+  ARRIVAL_MODE  = "poisson"           # "burst" or "poisson"
+                                      # burst: 所有请求在 t=0 同时到达, 像实验室里的整齐批处理, GPU 能吃满, 但不现实
+                                      # poisson: 每个请求随机时间到达, 更接近真实线上服务的情况, vLLM 通过 Continuous Batching 拼接请求, 保持吞吐
+  POISSON_RATE  = 64                  # 泊松到达强度 λ (req/秒), 越大表示更“拥挤”
+                                      # 越大 -> 请求越密集, batch 越容易被“填满”
+                                      # 越小 -> 请求间隔大, 调度器要更努力把零散请求拼在一起
+
+  ====================== Burst (all at t=0) ======================
+  # 所有请求一起提交 -> GPU 吃满, Decode 流水线顺畅
+  Requests: 128 | Window: 2.54s
+
+  # window 小, 因为所有请求同时开始, 几乎同时结束
+  Tokens In: 2432 (955.7 tok/s)
+  Tokens Out: 32768 (12876.6 tok/s)
+
+  # 几乎都是全部同时结束
+  Latency (P50/P90/P99): 2.51s / 2.53s / 2.53s
+
+  TTFT (P50/P90/P99): 0.05s / 0.06s / 0.07s
+
+  ====================== Poisson (lambda=64/s) ======================
+  # 请求是陆续到达的, batch 中一开始没有 128 个请求, GPU 吃不满
+  Requests: 128 | Window: 4.12s
+
+  # window 大, 请求陆续到达, 结束时间就晚
+  Tokens In: 2432 (589.8 tok/s)
+  Tokens Out: 32768 (7946.8 tok/s)
+
+  # 大部分请求的耗时和 Burst 差不多, 只是最后一批人因为到达得晚, 总窗口拉长了
+  Latency (P50/P90/P99): 2.59s / 2.67s / 2.68s
+
+  Poisson 下有些请求在“空闲时刻”到达, 能马上插入 decode 流水线, 迅速产出第一个 token
+  TTFT (P50/P90/P99): 0.02s / 0.02s / 0.04s
+
+  Q1: 为什么 Poisson 模式的 TTFT 反而更小?
+    在 vLLM 的 continuous batching 下, 解码是“按步(step)”推进的时钟;新请求到来后, 只要赶上下一拍, 就能被并进来参与下一个解码步;
+    (1) TTFT 由哪些部分组成(Decode heavy, 短 prompt)
+      对于一个新请求, TTFT ≈:
+        等到下一个调度步的时间(平均 ≈ 半个 step 周期)
+        很短的 prefill(10 个 token, 很快)
+        第一个 decode 步的计算时间
+      因为 prefill 很短, TTFT 的主要组成就是: 等下一拍 + 这拍的计算
+    (2) Burst vs Poisson 的“节拍”差异
+      Burst:
+        集中做一轮 prefill, 然后进入 decode pipeline
+        所有请求都要等到"第一拍 decode"开始, 第一拍之前没有"已在跑的时钟";
+        TTFT ≈ "准备好第一拍"(先集中做一轮 prefill) + 这一拍的计算
+      Poisson:
+        系统已经在"按拍解码"持续运转
+        新请求一到, 只要他的短 prefill 很快做完, 就能在下一拍被并进解码;
+        TTFT ≈ "等下一拍(短 prefill) + 这一拍计算
+
+      时间 →   |----Δ----|----Δ----|----Δ----|----Δ----|
+      Burst:   [到达].......(准备+首拍计算)→ 首 token
+      Poisson:        [到达]--(短pre)→| (下一拍就并进) → 首 token
+
+      在 Poisson 里, 你常常“插队”到下一个 |;在 Burst 里, 大家都等第一个 | 诞生
+    (3) 为什么 vLLM 能做到"下一拍就并进":
+      Continuous batching: 每个解码步都会重组批次, 把新来的序列并上去
+      PagedAttention: KV cache 分页, 插入新序列时不需要大块连续内存/重打包, 减少插入抖动和额外拷贝, 帮助保持“拍点”稳定
+      如果到达率 λ 远超算力上限, 拍点会被撑慢、排队变长, TTFT 会升高
+
+  Q2: 那么 GEN_TOKENS 增加会不会影响？
+    我认为不会明显变化, 因为 Poisson 场景的 TTFT 与 GEN_TOKENS 关系不大, 他更多取决于它的短 prefill
+    对于第一拍, 其实计算量没有变大, 每拍仍然只解一个 token, 所以单步 decode 的耗时不变 → 等待时间分布不变, TTFT 不会明显增加
+
+  Q3: PROMPT_TOKENS 从 10 提高到 1024(长 prompt), 你觉得 Poisson 场景下的 TTFT 会发生什么变化？
+    会显著增大, 每个请求的 prefill 变长, 这已经影响了第一拍的时间
+
+    == Poisson (lambda=64/s) ==
+    Requests: 128 | Window: 5.16s
+    Tokens In:  196736 (38163.6 tok/s)
+    Tokens Out: 32768 (6356.5 tok/s)
+    Latency (P50/P90/P99): 3.60s / 3.66s / 3.68s
+    TTFT   (P50/P90/P99): 0.03s / 0.04s / 0.12s
+
+  Q4: PROMPT_TOKENS 长短混合, 会发生什么？
+    长 prompt(1024 tokens) 对 TTFT 的 P90/P99 影响更大
+    长 prompt → prefill 更久, 新请求更容易错过最近一拍, 导致首 token 等待跨拍, 抬高 TTFT 尾部
+
+    == Poisson (lambda=64/s) (mixed 50% long) ==
+    Requests: 128 | Window: 4.81s
+
+    总体吞吐：Tokens Out/s ≈ 6.8k, 与“全长 prompt”情形相比略低但稳定——随机到达+长短混合下依然能维持高解码吞吐
+    Tokens In:  99584 (20687.0 tok/s)
+    Tokens Out: 32768 (6807.0 tok/s)
+    Latency (P50/P90/P99): 3.45s / 3.55s / 3.56s
+    TTFT   (P50/P90/P99): 0.03s / 0.04s / 0.07s
+
+    == Poisson (lambda=64/s) (mixed 50% long) — [short] ==
+    Requests: 64 | Window: 4.81s
+    Tokens In:  1216 (252.6 tok/s)
+    Tokens Out: 16384 (3403.5 tok/s)
+    Latency (P50/P90/P99): 3.46s / 3.55s / 3.56s
+    TTFT   (P50/P90/P99): 0.03s / 0.04s / 0.07s
+
+    == Poisson (lambda=64/s) (mixed 50% long) — [long] ==
+    Requests: 64 | Window: 4.80s
+    Tokens In:  98368 (20503.4 tok/s)
+    Tokens Out: 16384 (3415.0 tok/s)
+    Latency (P50/P90/P99): 3.45s / 3.55s / 3.56s
+
+    差异只体现在 P99 ——这正是“长 prefill 更容易错过最近一拍 → 长尾抬高”的特征
+    长 prompt 的 prefill 更久 → 更容易错过刚刚那一拍 → 需要等到下一拍, 所以只拉高 P99, 而不是整体右移(P50/P90 几乎不变)
+    TTFT   (P50/P90/P99): 0.03s / 0.04s / 0.09s
